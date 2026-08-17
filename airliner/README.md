@@ -1,63 +1,57 @@
 # Airliner Mod
 
-An attachable self-flying airliner with takeoff and waypoint landing capabilities for Luanti / Minetest.
+An attachable self-flying airliner with waypoint navigation, airport beacon tracking, Flight Computer GUI, and automatic shuttle loop for Luanti / Minetest.
 
-## Airutils Decision
-**airutils is not required.**
-This mod implements a controllable airliner entity with its own independent waypoint, takeoff, landing, and attachment systems using direct Luanti entity APIs. `airutils` is generally suited for airport props and shared vehicle helpers, which is beyond the scope of this standalone mod.
+## Features
+- **High-Speed Long-Distance Airline Flight**: Cruises smoothly across thousands of nodes at 50 m/s at a safe cruising altitude.
+- **Airport Waypoint Beacons**: Placeable beacon nodes that act as named airport / runway destinations.
+- **Interactive Flight Computer GUI**: Shift + Right-Click a parked airliner (or use `/airliner_gui`) to view route, select beacons from a dropdown, add coordinates, or launch.
+- **High-Precision Vertical Landing**: Approaches destinations at cruising altitude, aligns directly above the target (X, Z), and touches down gently onto the runway/beacon.
+- **Auto-Return Shuttle Loop**: If parked at a destination for 5 minutes without passengers, the airliner automatically takes off, reverses its route, and flies back to origin.
+- **100 HP & Pickaxe Removable**: Aircraft can be punched or dug with pickaxes to take damage (100 HP total), dropping the spawner item upon destruction.
 
 ## Installation
 1. Clone or copy the `airliner` folder into your world's or server's `worldmods/` or `mods/` directory.
 2. Enable the mod in your world settings.
 
 ## Spawning the Airliner
-- Using the item: You can obtain the "Airliner Spawner" from your inventory or by giving it to yourself. Place it on top of a node to spawn the airliner above it.
-- Using commands: Type `/airliner_spawn` in the chat to spawn an airliner directly in front of you.
+- **Item**: Place the "Airliner Spawner" on top of a solid block.
+- **Command**: Type `/airliner_spawn` in chat.
 
-## Attaching as a Pilot
-Right-click the airliner when it is grounded (parked). You will be attached as the pilot. The first person to attach (or spawn) the airliner will be set as its owner.
+## Setting Up Airline Routes
 
-## Flying and Waypoints
-To make the airliner take off, press `E` (or `AUX1`) while attached as the pilot, provided the airliner is grounded.
+### Method 1: Using Waypoint Beacons (Recommended)
+1. Place a **Waypoint Beacon** (`airliner:waypoint_beacon`) at Airport A (origin runway) and Airport B (destination runway).
+2. Right-click the beacon to name it (e.g. "Main Terminal", "Island Airport").
+3. Shift + Right-Click the airliner to open the **Flight Computer** and select your beacon from the dropdown, or the airliner will automatically detect placed beacons when taking off.
 
-Before taking off, you should add waypoints for the airliner to follow. A waypoint is treated as a landing destination. When multiple waypoints exist, each takeoff consumes the next waypoint in the queue.
+### Method 2: Using Chat Commands
+- `/airliner_waypoint x,y,z` - Adds a waypoint at specific coordinates.
+- `/airliner_waypoint_here` - Adds your current position as a waypoint.
+- `/airliner_beacon <name>` - Adds a named beacon to the flight plan.
 
-To set waypoints:
-- Use `/airliner_waypoint x,y,z` to set a waypoint at specific coordinates.
-- Use `/airliner_waypoint_here` to set a waypoint exactly where you are standing.
-
-Once the airliner takes off, it climbs to a safe altitude, cruises towards its target, and descends when nearing the waypoint to touch down at the coordinate.
-
-*Note on detaching:* You cannot detach while the airliner is in mid-air flying. The mod restricts this for safety and immersion. You must wait until it lands safely before being allowed to right-click again to detach. Furthermore, boarding is disallowed while the airliner is active.
+## Flying and Takeoff
+- **Boarding**: Right-click the airliner when grounded to board as the Pilot. Passengers can also right-click to board (up to 10 players total).
+- **Takeoff**: Press `E` (or `AUX1`) while seated as Pilot, or click **Takeoff** in the Flight Computer.
+- **Dismount**: Right-click when the airliner has landed safely to dismount.
 
 ## Chat Commands
-- `/airliner_spawn` - Spawns an airliner in front of the player.
-- `/airliner_waypoint x,y,z` - Adds a waypoint to the attached or nearest owned airliner.
-- `/airliner_waypoint_here` - Adds the player's current position as a waypoint.
-- `/airliner_clear` - Clears waypoints and current target.
-- `/airliner_stop` - Stops the airliner safely. If flying, it forces a landing straight down.
-- `/airliner_remove` - Removes the attached or nearest owned airliner.
+- `/airliner_gui` - Opens the Flight Computer GUI.
+- `/airliner_beacons` - Lists all registered airport beacons in the world.
+- `/airliner_waypoint x,y,z` - Adds a waypoint coordinate.
+- `/airliner_waypoint_here` - Adds player position as a waypoint.
+- `/airliner_beacon <name>` - Adds a registered beacon by name.
+- `/airliner_clear` - Clears the current route.
+- `/airliner_status` - Displays state, coordinates, queued stops, and auto-depart countdown.
+- `/airliner_tp` - Teleports you directly to your airliner.
+- `/airliner_stop` - Forces a safe landing straight down.
+- `/airliner_remove` - Removes the nearest airliner.
+- `/airliner_kill_all` - Removes all airliners in the world (useful to clean up old test planes).
 
-## Modifying Properties
-If you'd like to adjust scale, speed, or the collision box:
-- **Speed**: Modify `CRUISE_SPEED` and `CLIMB_SPEED` constants at the top of `init.lua`.
-- **Scale/Visual Size**: Adjust the `visual_size = {x = 1, y = 1, z = 1}` property inside `core.register_entity("airliner:airliner", ...)`.
-- **Collision**: Adjust the `collisionbox` and `selectionbox` fields in the same entity registration.
-
-## Public API Example
-```lua
-local pos = {x = 0, y = 5, z = 0}
-local obj = airliner.spawn(pos, "alice")
-
-airliner.add_waypoint(obj, {x = 100, y = 10, z = 0})
-airliner.add_waypoint(obj, {x = 200, y = 12, z = 100})
-
-local player = core.get_player_by_name("alice")
-if player then
-    airliner.attach(player, obj, {x = 0, y = 10, z = 0})
-end
-```
+## Crafting Recipes
+- **Airliner Spawner**: 5 Steel Ingots + 2 Glass blocks.
+- **Waypoint Beacon**: 4 Steel Ingots + 2 Glass + 1 Torch.
 
 ## License
 All code is provided under the MIT License.
-All generated textures and resources are provided under CC0 (Public Domain).
+All textures and models are provided under CC0 (Public Domain).
