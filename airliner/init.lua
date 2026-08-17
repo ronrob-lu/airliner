@@ -189,6 +189,7 @@ core.register_entity("airliner:airliner", {
         mesh = "airliner.obj",
         textures = {"airliner.png"},
         visual_size = {x = 20, y = 20, z = 20},
+        backface_culling = false,
         static_save = true,
         pointable = true,
     },
@@ -272,8 +273,31 @@ core.register_entity("airliner:airliner", {
         local pos = self.object:get_pos()
         local dist = vec_distance(pos, self.target_waypoint)
 
-        if dist < 5 then
-            -- Arrived at waypoint
+        if self.state == "descending" then
+            -- We are descending to the ground. Check node below collision box.
+            -- Collision box goes down to -2 * 20 = -40. Let's check a bit further down, e.g. pos.y - 42.
+            local ground_y = pos.y - 42
+            local node = core.get_node({x=pos.x, y=ground_y, z=pos.z})
+            local nodedef = core.registered_nodes[node.name]
+
+            if nodedef and node.name ~= "air" and node.name ~= "ignore" and (nodedef.walkable or nodedef.liquidtype ~= "none") then
+                self.object:set_velocity({x=0, y=0, z=0})
+                self.state = "arrived"
+                self.target_waypoint = nil
+                core.log("action", "[Airliner] Reached ground. Landing complete.")
+                local f = io.open(core.get_worldpath() .. "/airliner_debug.txt", "a")
+                if f then f:write("[Airliner] Reached ground. Landing complete.\n") f:close() end
+                self:_save_state()
+            else
+                self.object:set_velocity({x=0, y=-CLIMB_SPEED, z=0})
+            end
+            return
+        end
+
+        local h_dist = vec_distance({x=pos.x, y=0, z=pos.z}, {x=self.target_waypoint.x, y=0, z=self.target_waypoint.z})
+
+        if dist < 5 or (self.state == "landing" and h_dist < 5) then
+            -- Arrived at waypoint (or close horizontally while landing)
             if #self.waypoints > 0 then
                 self.target_waypoint = table.remove(self.waypoints, 1)
                 self.state = "takeoff" -- Continue to the next waypoint
@@ -281,13 +305,13 @@ core.register_entity("airliner:airliner", {
                 local f = io.open(core.get_worldpath() .. "/airliner_debug.txt", "a")
                 if f then f:write("[Airliner] Reached waypoint, continuing to next waypoint.\n") f:close() end
             else
-                self.object:set_velocity({x=0, y=0, z=0})
-                self.object:set_pos(self.target_waypoint)
-                self.state = "arrived"
-                self.target_waypoint = nil
-                core.log("action", "[Airliner] Reached final destination. Landing complete.")
+                -- Stop horizontally, start descending
+                self.object:set_velocity({x=0, y=-CLIMB_SPEED, z=0})
+                self.object:set_pos({x=self.target_waypoint.x, y=pos.y, z=self.target_waypoint.z})
+                self.state = "descending"
+                core.log("action", "[Airliner] Reached final destination X/Z. Starting descent.")
                 local f = io.open(core.get_worldpath() .. "/airliner_debug.txt", "a")
-                if f then f:write("[Airliner] Reached final destination. Landing complete.\n") f:close() end
+                if f then f:write("[Airliner] Reached final destination X/Z. Starting descent.\n") f:close() end
             end
             self:_save_state()
             return
@@ -306,7 +330,7 @@ core.register_entity("airliner:airliner", {
                 if f then f:write("[Airliner] Reached cruising altitude. State: cruise.\n") f:close() end
             end
         elseif self.state == "cruise" then
-            if dist < 30 then
+            if h_dist < 30 then
                 self.state = "landing"
                 core.log("action", "[Airliner] Approaching target. State: landing.")
                 local f = io.open(core.get_worldpath() .. "/airliner_debug.txt", "a")
@@ -316,6 +340,7 @@ core.register_entity("airliner:airliner", {
                 self.object:set_velocity(vec_mul(vel_dir, CRUISE_SPEED))
             end
         elseif self.state == "landing" then
+            -- Guide it towards the waypoint, both horizontally and vertically
             self.object:set_velocity(vec_mul(dir, CLIMB_SPEED))
         end
     end,
