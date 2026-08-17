@@ -178,7 +178,7 @@ local vec_distance = vector.distance
 
 local CRUISE_SPEED = 30
 local CLIMB_SPEED = 10
-local CRUISE_ALTITUDE = 50
+local CRUISE_ALTITUDE = 100
 
 core.register_entity("airliner:airliner", {
     initial_properties = {
@@ -235,10 +235,10 @@ core.register_entity("airliner:airliner", {
         if #self.waypoints > 0 then
             self.target_waypoint = table.remove(self.waypoints, 1)
         else
-            -- Create fallback waypoint 100 nodes ahead and 50 nodes up
+            -- Create fallback waypoint 1000 nodes ahead and at CRUISE_ALTITUDE
             local dir = core.yaw_to_dir(self.object:get_yaw() or 0)
             local pos = self.object:get_pos()
-            self.target_waypoint = vec_add(pos, vec_add(vec_mul(dir, 100), {x=0, y=50, z=0}))
+            self.target_waypoint = vec_add(pos, vec_add(vec_mul(dir, 1000), {x=0, y=CRUISE_ALTITUDE, z=0}))
         end
 
         self.state = "takeoff"
@@ -321,8 +321,10 @@ core.register_entity("airliner:airliner", {
         self.object:set_yaw(core.dir_to_yaw(dir))
 
         if self.state == "takeoff" then
-            if pos.y < self.target_waypoint.y and math.abs(self.target_waypoint.y - pos.y) > 10 then
-                self.object:set_velocity(vec_mul(dir, CLIMB_SPEED))
+            if pos.y < CRUISE_ALTITUDE and math.abs(CRUISE_ALTITUDE - pos.y) > 10 then
+                -- Climb to CRUISE_ALTITUDE before focusing on reaching the waypoint
+                local climb_dir = vec_normalize({x=dir.x, y=1, z=dir.z})
+                self.object:set_velocity(vec_mul(climb_dir, CLIMB_SPEED))
             else
                 self.state = "cruise"
                 core.log("action", "[Airliner] Reached cruising altitude. State: cruise.")
