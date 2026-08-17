@@ -99,7 +99,9 @@ function airliner.attach(child, airliner_obj, offset, rotation)
         if child:is_player() and not ent.owner then
             ent.owner = child:get_player_name()
         end
-        child:set_attach(airliner_obj, "", offset or {x = 0, y = 15, z = 0}, rotation or {x = 0, y = 0, z = 0})
+        local attach_offset = offset or {x = 0, y = 15, z = 0}
+        child:set_attach(airliner_obj, "", {x=attach_offset.x/20, y=attach_offset.y/20, z=attach_offset.z/20}, rotation or {x = 0, y = 0, z = 0})
+        child:set_properties({visual_size = {x=1/20, y=1/20, z=1/20}})
         ent:_save_state()
         return true
     end
@@ -109,7 +111,8 @@ function airliner.attach(child, airliner_obj, offset, rotation)
         table.insert(ent.passengers, child)
         -- Provide an offset for passengers so they don't overlap with the pilot
         local p_offset = offset or {x = 0, y = 15, z = -10 - (#ent.passengers * 5)}
-        child:set_attach(airliner_obj, "", p_offset, rotation or {x = 0, y = 0, z = 0})
+        child:set_attach(airliner_obj, "", {x=p_offset.x/20, y=p_offset.y/20, z=p_offset.z/20}, rotation or {x = 0, y = 0, z = 0})
+        child:set_properties({visual_size = {x=1/20, y=1/20, z=1/20}})
         ent:_save_state()
         return true
     else
@@ -150,6 +153,7 @@ function airliner.detach(child, force)
     end
 
     child:set_detach()
+    child:set_properties({visual_size = {x=1, y=1, z=1}})
     if ent then ent:_save_state() end
     return true
 end
@@ -179,12 +183,12 @@ local CRUISE_ALTITUDE = 50
 core.register_entity("airliner:airliner", {
     initial_properties = {
         physical = false,
-        collisionbox = {-4, -2, -4, 4, 4, 4},
-        selectionbox = {-4, -2, -4, 4, 4, 4},
+        collisionbox = {-4 * 20, -2 * 20, -4 * 20, 4 * 20, 4 * 20, 4 * 20},
+        selectionbox = {-4 * 20, -2 * 20, -4 * 20, 4 * 20, 4 * 20, 4 * 20},
         visual = "mesh",
         mesh = "airliner.obj",
         textures = {"airliner.png"},
-        visual_size = {x = 1, y = 1, z = 1},
+        visual_size = {x = 20, y = 20, z = 20},
         static_save = true,
         pointable = true,
     },
@@ -237,12 +241,18 @@ core.register_entity("airliner:airliner", {
         end
 
         self.state = "takeoff"
+        core.log("action", "[Airliner] Commencing takeoff sequence.")
+        local f = io.open(core.get_worldpath() .. "/airliner_debug.txt", "a")
+        if f then f:write("[Airliner] Commencing takeoff sequence.\n") f:close() end
         self:_save_state()
     end,
 
     _force_landing = function(self)
         self.object:set_velocity({x = 0, y = -10, z = 0})
         self.state = "landing"
+        core.log("action", "[Airliner] Force landing initiated.")
+        local f = io.open(core.get_worldpath() .. "/airliner_debug.txt", "a")
+        if f then f:write("[Airliner] Force landing initiated.\n") f:close() end
         self.target_waypoint = self.object:get_pos()
         self.target_waypoint.y = self.target_waypoint.y - 100 -- Arbitrary ground target
         self:_save_state()
@@ -264,10 +274,21 @@ core.register_entity("airliner:airliner", {
 
         if dist < 5 then
             -- Arrived at waypoint
-            self.object:set_velocity({x=0, y=0, z=0})
-            self.object:set_pos(self.target_waypoint)
-            self.state = "arrived"
-            self.target_waypoint = nil
+            if #self.waypoints > 0 then
+                self.target_waypoint = table.remove(self.waypoints, 1)
+                self.state = "takeoff" -- Continue to the next waypoint
+                core.log("action", "[Airliner] Reached waypoint, continuing to next waypoint.")
+                local f = io.open(core.get_worldpath() .. "/airliner_debug.txt", "a")
+                if f then f:write("[Airliner] Reached waypoint, continuing to next waypoint.\n") f:close() end
+            else
+                self.object:set_velocity({x=0, y=0, z=0})
+                self.object:set_pos(self.target_waypoint)
+                self.state = "arrived"
+                self.target_waypoint = nil
+                core.log("action", "[Airliner] Reached final destination. Landing complete.")
+                local f = io.open(core.get_worldpath() .. "/airliner_debug.txt", "a")
+                if f then f:write("[Airliner] Reached final destination. Landing complete.\n") f:close() end
+            end
             self:_save_state()
             return
         end
@@ -280,10 +301,16 @@ core.register_entity("airliner:airliner", {
                 self.object:set_velocity(vec_mul(dir, CLIMB_SPEED))
             else
                 self.state = "cruise"
+                core.log("action", "[Airliner] Reached cruising altitude. State: cruise.")
+                local f = io.open(core.get_worldpath() .. "/airliner_debug.txt", "a")
+                if f then f:write("[Airliner] Reached cruising altitude. State: cruise.\n") f:close() end
             end
         elseif self.state == "cruise" then
             if dist < 30 then
                 self.state = "landing"
+                core.log("action", "[Airliner] Approaching target. State: landing.")
+                local f = io.open(core.get_worldpath() .. "/airliner_debug.txt", "a")
+                if f then f:write("[Airliner] Approaching target. State: landing.\n") f:close() end
             else
                 local vel_dir = vec_normalize({x=dir.x, y=0, z=dir.z})
                 self.object:set_velocity(vec_mul(vel_dir, CRUISE_SPEED))
