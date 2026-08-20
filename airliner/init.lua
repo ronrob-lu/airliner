@@ -47,20 +47,30 @@ local function remove_beacon_record_by_pos(pos)
 end
 
 -- ----------------------------------------------------------------------------
--- Constants
+-- Constants & Flight Profiles
 -- ----------------------------------------------------------------------------
 
-local CRUISE_SPEED      = 50   -- nodes/second horizontal cruise speed (airline speed)
-local CLIMB_SPEED       = 15   -- nodes/second vertical climb
-local CRUISE_ALT_OFFSET = 100  -- nodes above takeoff/landing for cruising
-local MIN_CRUISE_Y      = 120  -- minimum absolute Y altitude for cruising (clear hills/trees)
-local WAYPOINT_DIST     = 25   -- horizontal distance to advance intermediate waypoint
-local LANDING_ALIGN_DIST = 4   -- horizontal distance to align directly above destination
-local DESCEND_SPEED     = 10   -- nodes/second straight descent rate
-local IDLE_TIMEOUT      = 300  -- 5 minutes in seconds before auto-return shuttle
+local CRUISE_SPEED        = 50   -- nodes/second horizontal cruise speed (airline speed)
+local TAXI_SPEED          = 12   -- nodes/second initial ground roll & touchdown speed
+local TAKEOFF_DISTANCE    = 100  -- nodes horizontal takeoff corridor distance
+local TAKEOFF_ROLL_DIST   = 25   -- nodes on-ground runway roll before rotation/liftoff
+local LANDING_DISTANCE    = 100  -- nodes horizontal landing approach & glide slope distance
+local LANDING_FLARE_DIST  = 20   -- nodes flare zone before touchdown
+local CRUISE_ALT_OFFSET   = 100  -- nodes above takeoff/landing for cruising
+local MIN_CRUISE_Y        = 120  -- minimum absolute Y altitude for cruising (clear hills/trees)
+local WAYPOINT_DIST       = 25   -- horizontal distance to advance intermediate waypoint
+local IDLE_TIMEOUT        = 30   -- 30 seconds for debug before auto-return shuttle
+local STUCK_TIMEOUT       = 4.0  -- seconds without movement before declaring stuck on landing
 
--- Global tracking of all active airliners (even across long distances)
+-- Global tracking of all active airliners
 airliner.tracked_planes = {}
+
+-- Mod Storage & Kill Epoch Initialization
+local mod_storage = (core.get_mod_storage and core.get_mod_storage()) or nil
+local global_kill_epoch = 0
+if mod_storage and mod_storage.get_int then
+    global_kill_epoch = mod_storage:get_int("kill_epoch") or 0
+end
 
 -- ----------------------------------------------------------------------------
 -- Helpers
@@ -72,7 +82,19 @@ local vec_mul       = vector.multiply
 local vec_normalize = vector.normalize
 local vec_distance  = vector.distance
 
---- Find solid ground Y below pos, ignoring leaves and air so we land on actual ground/runway
+--- Apply 3D pitch/yaw/roll attitude to airliner mesh (supports Luanti 5.0+)
+local function set_aircraft_rotation(obj, pitch, yaw, roll)
+    pitch = pitch or 0
+    yaw = yaw or 0
+    roll = roll or 0
+    if obj and obj.set_rotation then
+        obj:set_rotation({x = pitch, y = yaw, z = roll})
+    elseif obj and obj.set_yaw then
+        obj:set_yaw(yaw)
+    end
+end
+
+--- Find solid ground Y below pos, ignoring leaves and air
 local function find_ground_y(pos, max_depth)
     max_depth = max_depth or 300
     for dy = 0, max_depth do
@@ -84,7 +106,6 @@ local function find_ground_y(pos, max_depth)
                 if def.walkable and not (def.groups and def.groups.leaves) then
                     return check.y + 1
                 elseif def.walkable then
-                    -- If leaves or other walkable block, still usable if nothing below
                     return check.y + 1
                 end
             end
@@ -93,6 +114,60 @@ local function find_ground_y(pos, max_depth)
         end
     end
     return nil
+end
+
+--- Pre-flight runway clearance check over 100 blocks
+-- Scans the takeoff corridor for trees, structures, or terrain
+local function check_takeoff_runway(start_pos, target_pos, target_cruise_y)
+    if not start_pos or not target_pos or not target_pos.x or not target_pos.z then return true end
+    local dx = target_pos.x - start_pos.x
+    local dz = target_pos.z - start_pos.z
+    local total_h = math.sqrt(dx * dx + dz * dz)
+    if total_h < 1 then return true end
+
+    local h_dir = {x = dx / total_h, y = 0, z = dz / total_h}
+    local scan_dist = math.min(TAKEOFF_DISTANCE, total_h)
+
+    -- Step every 2 nodes along the takeoff trajectory
+    for d = 2, scan_dist, 2 do
+        local expected_y
+        if d <= TAKEOFF_ROLL_DIST then
+            -- Ground roll phase: aircraft is rolling on the runway
+            expected_y = start_pos.y
+        else
+            -- Climb phase: smooth S-curve climb towards cruise altitude
+            local u = (d - TAKEOFF_ROLL_DIST) / (TAKEOFF_DISTANCE - TAKEOFF_ROLL_DIST)
+            u = math.max(0, math.min(1, u))
+            local smooth_u = u * u * (3 - 2 * u)
+            expected_y = start_pos.y + (target_cruise_y - start_pos.y) * smooth_u
+        end
+
+        local center_x = start_pos.x + h_dir.x * d
+        local center_z = start_pos.z + h_dir.z * d
+
+        -- Check clearance bounding volume around aircraft (width 3, height 3)
+        local y_start = (d <= TAKEOFF_ROLL_DIST) and 1 or 0
+        for cy = y_start, 3 do
+            for cx = -1, 1 do
+                for cz = -1, 1 do
+                    local check_pos = {
+                        x = math.floor(center_x + cx + 0.5),
+                        y = math.floor(expected_y + cy + 0.5),
+                        z = math.floor(center_z + cz + 0.5),
+                    }
+                    local node = core.get_node_or_nil(check_pos)
+                    if node and node.name ~= "air" and node.name ~= "ignore" then
+                        local def = core.registered_nodes[node.name]
+                        if def and (def.walkable or (def.groups and (def.groups.tree or def.groups.leaves or def.groups.wood or def.groups.stone))) then
+                            return false, "Runway blocked: Obstacle (" .. node.name .. ") detected at (" .. check_pos.x .. ", " .. check_pos.y .. ", " .. check_pos.z .. ") along the 100-block takeoff path. Please clear the runway."
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return true
 end
 
 -- ----------------------------------------------------------------------------
@@ -108,6 +183,49 @@ function airliner.spawn(pos, owner)
         end
     end
     return obj
+end
+
+function airliner.materialize_entity(plane_id)
+    local p = airliner.tracked_planes[plane_id]
+    if not p then return nil end
+
+    if p.object and p.object.get_pos and p.object:get_pos() ~= nil then
+        return p.object
+    end
+
+    local pos = p.pos
+    if not pos then return nil end
+
+    core.forceload_block(pos, true)
+
+    local staticdata = core.serialize({
+        plane_id         = plane_id,
+        state            = p.state or "ground",
+        waypoints        = p.waypoints or {},
+        target_waypoint  = p.target_waypoint,
+        owner            = p.owner,
+        takeoff_y        = p.takeoff_y or pos.y,
+        target_cruise_y  = p.target_cruise_y or 120,
+        idle_timer       = p.idle_timer or 0,
+        full_route       = p.full_route or {},
+        route_direction  = p.route_direction or "forward",
+        flight_start_pos = p.flight_start_pos or pos,
+        landing_start_y  = p.landing_start_y,
+        landing_target_y = p.landing_target_y,
+    })
+
+    local obj = core.add_entity(pos, "airliner:airliner", staticdata)
+    if obj then
+        p.object = obj
+        if p.target_waypoint then
+            local dx = p.target_waypoint.x - pos.x
+            local dz = p.target_waypoint.z - pos.z
+            local yaw = math.atan2(-dx, dz)
+            set_aircraft_rotation(obj, 0, yaw, 0)
+        end
+        return obj
+    end
+    return nil
 end
 
 function airliner.get_airliner(obj)
@@ -143,8 +261,7 @@ function airliner.add_waypoint(obj, pos, name)
             z = math.floor(pos.z),
             name = name or ("WP " .. (#ent.waypoints + 1))
         })
-        -- Reset route if parked so it rebuilds full_route with new waypoints
-        if ent.state == "ground" or ent.state == "arrived" then
+        if ent.state == "ground" or ent.state == "arrived" or ent.state == "stuck" then
             ent.full_route = {}
         end
         return true
@@ -181,7 +298,7 @@ function airliner.attach(child, airliner_obj, offset, rotation)
     if not child or not child:is_player() then return false end
     local p_name = child:get_player_name()
 
-    if ent.state ~= "ground" and ent.state ~= "arrived" then
+    if ent.state ~= "ground" and ent.state ~= "arrived" and ent.state ~= "stuck" then
         core.chat_send_player(p_name, "[Airliner] Cannot board while the airliner is flying.")
         return false
     end
@@ -243,8 +360,9 @@ function airliner.detach(child, force)
     end
 
     if ent then
-        if not force and (ent.state ~= "ground" and ent.state ~= "arrived") then
-            core.chat_send_player(p_name, "[Airliner] Cannot detach while the airliner is flying.")
+        -- Allow dismount if grounded, arrived, stuck, or forced
+        if not force and (ent.state ~= "ground" and ent.state ~= "arrived" and ent.state ~= "stuck") then
+            core.chat_send_player(p_name, "[Airliner] Cannot detach while airliner is in active flight.")
             return false
         end
 
@@ -288,7 +406,7 @@ function airliner.get_state(obj)
 end
 
 -- ----------------------------------------------------------------------------
--- Airliner Entity
+-- Airliner Entity Definition
 -- ----------------------------------------------------------------------------
 
 core.register_entity("airliner:airliner", {
@@ -300,28 +418,33 @@ core.register_entity("airliner:airliner", {
         mesh = "airliner.obj",
         textures = {"airliner.png"},
         visual_size = {x = 20, y = 20, z = 20},
-        backface_culling = false,
+        backface_culling = true,
         static_save = true,
         pointable = true,
         hp_max = 100,
     },
 
     -- Instance fields
-    state           = "ground",
-    waypoints       = {},
-    target_waypoint = nil,
-    owner           = nil,
-    pilot           = nil,
-    passengers      = {},
-    aux1_held       = false,
-    takeoff_y       = 0,
-    target_cruise_y = 120,
-    idle_timer      = 0,
-    full_route      = {},
-    route_direction = "forward",
+    state              = "ground",
+    waypoints          = {},
+    target_waypoint    = nil,
+    owner              = nil,
+    pilot              = nil,
+    passengers         = {},
+    aux1_held          = false,
+    takeoff_y          = 0,
+    target_cruise_y    = 120,
+    idle_timer         = 0,
+    stuck_timer        = 0,
+    full_route         = {},
+    route_direction    = "forward",
+    flight_start_pos   = nil,
+    landing_start_y    = nil,
+    landing_target_y   = nil,
+    last_pos           = nil,
 
     -- -----------------------------------------------------------------------
-    -- Lifecycle
+    -- Lifecycle & Authoritative Entity Singleton
     -- -----------------------------------------------------------------------
 
     on_activate = function(self, staticdata)
@@ -330,42 +453,133 @@ core.register_entity("airliner:airliner", {
         self.passengers = {}
         self.full_route = {}
         self.idle_timer = 0
+        self.stuck_timer = 0
         self.route_direction = "forward"
 
         if staticdata and staticdata ~= "" then
             local data = core.deserialize(staticdata)
             if data then
-                self.state           = data.state or "ground"
-                self.waypoints       = data.waypoints or {}
-                self.target_waypoint = data.target_waypoint
-                self.owner           = data.owner
-                self.takeoff_y       = data.takeoff_y or 0
-                self.target_cruise_y = data.target_cruise_y or 120
-                self.idle_timer      = data.idle_timer or 0
-                self.full_route      = data.full_route or {}
-                self.route_direction = data.route_direction or "forward"
-                self.plane_id        = data.plane_id
+                self.state            = data.state or "ground"
+                self.waypoints        = data.waypoints or {}
+                self.target_waypoint  = data.target_waypoint
+                self.owner            = data.owner
+                self.takeoff_y        = data.takeoff_y or 0
+                self.target_cruise_y  = data.target_cruise_y or 120
+                self.idle_timer       = data.idle_timer or 0
+                self.full_route       = data.full_route or {}
+                self.route_direction  = data.route_direction or "forward"
+                self.plane_id         = data.plane_id
+                self.flight_start_pos = data.flight_start_pos
+                self.landing_start_y  = data.landing_start_y
+                self.landing_target_y = data.landing_target_y
             end
         end
+
+        -- Ensure unique plane_id
+        if not self.plane_id or self.plane_id == "" then
+            self.plane_id = "plane_" .. tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999))
+        end
+
+        -- EPOCH PURGE: Purge any dormant entity from previous test sessions before the last /airliner_kill_all
+        local kill_epoch = global_kill_epoch
+        if mod_storage and mod_storage.get_int then
+            kill_epoch = math.max(kill_epoch, mod_storage:get_int("kill_epoch") or 0)
+        end
+        local plane_ts = tonumber(string.match(self.plane_id or "", "^plane_(%d+)_")) or 0
+        if plane_ts > 0 and plane_ts <= kill_epoch then
+            core.log("action", "[Airliner] Purged dormant airliner (" .. self.plane_id .. ") created at " .. plane_ts .. " <= kill_epoch " .. kill_epoch)
+            self.object:remove()
+            return
+        end
+
+        local my_pos = self.object:get_pos()
+
+        -- DEDUPLICATION & OBSOLETE SNAPSHOT PURGE:
+        local existing = airliner.tracked_planes[self.plane_id]
+        if existing then
+            if existing.object and existing.object ~= self.object and existing.object:get_pos() ~= nil then
+                core.log("action", "[Airliner] Removed duplicate airliner instance for " .. self.plane_id)
+                self.object:remove()
+                return
+            end
+
+            -- If existing tracking has moved far away (> 15m), this loaded entity is an obsolete snapshot from an unloaded mapblock
+            if existing.pos and my_pos and vector.distance(my_pos, existing.pos) > 15.0 then
+                core.log("action", "[Airliner] Removed obsolete airliner snapshot for " .. self.plane_id .. " at (" .. math.floor(my_pos.x) .. "," .. math.floor(my_pos.y) .. "," .. math.floor(my_pos.z) .. "), active pos is (" .. math.floor(existing.pos.x) .. "," .. math.floor(existing.pos.y) .. "," .. math.floor(existing.pos.z) .. ")")
+                self.object:remove()
+                return
+            end
+
+            -- Otherwise, adopt existing state from tracking
+            self.state = existing.state or self.state
+            self.waypoints = existing.waypoints or self.waypoints
+            self.full_route = existing.full_route or self.full_route
+            self.target_waypoint = existing.target_waypoint or self.target_waypoint
+            self.route_direction = existing.route_direction or self.route_direction
+            self.target_cruise_y = existing.target_cruise_y or self.target_cruise_y
+            self.idle_timer = existing.idle_timer or self.idle_timer
+            self.takeoff_y = existing.takeoff_y or self.takeoff_y
+            self.flight_start_pos = existing.flight_start_pos or self.flight_start_pos
+            self.landing_start_y = existing.landing_start_y or self.landing_start_y
+            self.landing_target_y = existing.landing_target_y or self.landing_target_y
+        end
+
+        -- PROXIMITY DEDUPLICATION: Remove overlapping clone sitting at the exact same parked position (< 3m)
+        if my_pos and (self.state == "ground" or self.state == "arrived") then
+            for id, p in pairs(airliner.tracked_planes) do
+                if id ~= self.plane_id and p.object and p.object ~= self.object and p.object:get_pos() then
+                    local d = vector.distance(my_pos, p.object:get_pos())
+                    if d < 3.0 then
+                        core.log("action", "[Airliner] Removed overlapping airliner clone at (" .. math.floor(my_pos.x) .. "," .. math.floor(my_pos.y) .. "," .. math.floor(my_pos.z) .. ")")
+                        self.object:remove()
+                        return
+                    end
+                end
+            end
+        end
+
+        self.object:set_properties({static_save = true, backface_culling = true})
+        airliner.tracked_planes[self.plane_id] = {
+            id = self.plane_id,
+            object = self.object,
+            owner = self.owner,
+            state = self.state,
+            pos = my_pos,
+            waypoints = self.waypoints,
+            full_route = self.full_route,
+            target_waypoint = self.target_waypoint,
+            route_direction = self.route_direction,
+            idle_timer = self.idle_timer,
+            target_cruise_y = self.target_cruise_y,
+            takeoff_y = self.takeoff_y,
+            flight_start_pos = self.flight_start_pos,
+            landing_start_y = self.landing_start_y,
+            landing_target_y = self.landing_target_y,
+            pilot_name = self.pilot_name,
+            passenger_names = self.passenger_names,
+        }
     end,
 
     get_staticdata = function(self)
         return core.serialize({
-            state           = self.state,
-            waypoints       = self.waypoints,
-            target_waypoint = self.target_waypoint,
-            owner           = self.owner,
-            takeoff_y       = self.takeoff_y,
-            target_cruise_y = self.target_cruise_y,
-            idle_timer      = self.idle_timer,
-            full_route      = self.full_route,
-            route_direction = self.route_direction,
-            plane_id        = self.plane_id,
+            state            = self.state,
+            waypoints        = self.waypoints,
+            target_waypoint  = self.target_waypoint,
+            owner            = self.owner,
+            takeoff_y        = self.takeoff_y,
+            target_cruise_y  = self.target_cruise_y,
+            idle_timer       = self.idle_timer,
+            full_route       = self.full_route,
+            route_direction  = self.route_direction,
+            plane_id         = self.plane_id,
+            flight_start_pos = self.flight_start_pos,
+            landing_start_y  = self.landing_start_y,
+            landing_target_y = self.landing_target_y,
         })
     end,
 
     -- -----------------------------------------------------------------------
-    -- Punch → take damage from pickaxes/tools, drop spawner at 0 HP
+    -- Punch -> Damage & Drop
     -- -----------------------------------------------------------------------
 
     on_punch = function(self, puncher, time_from_last_punch, tool_capabilities, dir, damage)
@@ -375,9 +589,7 @@ core.register_entity("airliner:airliner", {
             core.chat_send_player(p_name, "[Airliner] HP: " .. math.max(0, hp) .. " / 100")
         end
         if hp <= 0 then
-            if self.pilot then
-                airliner.detach(self.pilot, true)
-            end
+            if self.pilot then airliner.detach(self.pilot, true) end
             if self.passengers then
                 for i = #self.passengers, 1, -1 do
                     airliner.detach(self.passengers[i], true)
@@ -398,33 +610,62 @@ core.register_entity("airliner:airliner", {
             if self.plane_id then
                 airliner.tracked_planes[self.plane_id] = nil
             end
+            if self.forceloaded_pos then
+                core.forceload_free_block(self.forceloaded_pos, true)
+                self.forceloaded_pos = nil
+            end
             self.object:remove()
         end
     end,
 
     -- -----------------------------------------------------------------------
-    -- Internal: takeoff / landing
+    -- Internal: Takeoff & Landing
     -- -----------------------------------------------------------------------
 
     _start_takeoff = function(self)
-        if self.state ~= "ground" and self.state ~= "arrived" then return false end
+        if self.state ~= "ground" and self.state ~= "arrived" and self.state ~= "stuck" then return false end
 
         local pos = self.object:get_pos()
+        if not pos then return false end
         self.takeoff_y = pos.y
 
-        -- If no waypoints exist, auto-check placed beacons in the world
-        if #self.waypoints == 0 and #self.full_route == 0 then
+        -- 1. If waypoints are empty but full_route exists with >= 2 stops, reverse/advance shuttle route
+        if #self.waypoints == 0 and not self.target_waypoint and #self.full_route >= 2 then
+            self.waypoints = {}
+            if self.route_direction == "forward" then
+                self.route_direction = "reverse"
+                for i = #self.full_route - 1, 1, -1 do
+                    table.insert(self.waypoints, {
+                        x = self.full_route[i].x,
+                        y = self.full_route[i].y,
+                        z = self.full_route[i].z,
+                        name = self.full_route[i].name,
+                    })
+                end
+            else
+                self.route_direction = "forward"
+                for i = 2, #self.full_route do
+                    table.insert(self.waypoints, {
+                        x = self.full_route[i].x,
+                        y = self.full_route[i].y,
+                        z = self.full_route[i].z,
+                        name = self.full_route[i].name,
+                    })
+                end
+            end
+        end
+
+        -- 2. If STILL no waypoints and no full_route, auto-check placed beacons in the world
+        if #self.waypoints == 0 and not self.target_waypoint and #self.full_route == 0 then
             local beacons = get_all_beacons()
             local beacon_list = {}
             for _, b in pairs(beacons) do
-                -- Exclude beacon at current position
                 local d = vector.distance(pos, {x = b.x, y = b.y, z = b.z})
                 if d > 20 then
                     table.insert(beacon_list, b)
                 end
             end
             if #beacon_list > 0 then
-                -- Sort by distance from current pos
                 table.sort(beacon_list, function(a, b)
                     return vector.distance(pos, {x = a.x, y = a.y, z = a.z}) < vector.distance(pos, {x = b.x, y = b.y, z = b.z})
                 end)
@@ -438,15 +679,15 @@ core.register_entity("airliner:airliner", {
             end
         end
 
-        -- If STILL no waypoints, warn and do NOT take off into random wilderness!
-        if #self.waypoints == 0 and #self.full_route == 0 then
+        -- 3. If STILL no waypoints, warn and do not take off
+        if #self.waypoints == 0 and not self.target_waypoint then
             if self.pilot and self.pilot:is_player() then
                 core.chat_send_player(self.pilot:get_player_name(), "[Airliner] No destination set! Place a Waypoint Beacon or use /airliner_waypoint x,y,z or Shift+Right-Click to open Flight Computer.")
             end
             return false
         end
 
-        -- Capture full_route on the first departure
+        -- 4. Capture full_route on the first departure
         if #self.waypoints > 0 and #self.full_route == 0 then
             self.full_route = {}
             table.insert(self.full_route, {x = math.floor(pos.x), y = math.floor(pos.y), z = math.floor(pos.z), name = "Origin (Airport A)"})
@@ -456,28 +697,56 @@ core.register_entity("airliner:airliner", {
             self.route_direction = "forward"
         end
 
-        if #self.waypoints > 0 then
+        if not self.target_waypoint and #self.waypoints > 0 then
             self.target_waypoint = table.remove(self.waypoints, 1)
         end
 
+        if not self.target_waypoint then
+            return false
+        end
+
         -- Compute safe cruising altitude
-        local target_y = (self.target_waypoint and self.target_waypoint.y) or pos.y
+        local target_y = self.target_waypoint.y or pos.y
         local max_y = math.max(pos.y, target_y)
         self.target_cruise_y = math.max(MIN_CRUISE_Y, max_y + CRUISE_ALT_OFFSET)
 
+        -- 100-Block Pre-flight Runway Clearance Check
+        local is_clear, block_reason = check_takeoff_runway(pos, self.target_waypoint, self.target_cruise_y)
+        if not is_clear then
+            core.log("warning", "[Airliner] Takeoff aborted: " .. block_reason)
+            if self.pilot and self.pilot:is_player() then
+                core.chat_send_player(self.pilot:get_player_name(), "[Airliner] " .. block_reason)
+            end
+            -- Re-queue target waypoint so it is not lost
+            if self.target_waypoint then
+                table.insert(self.waypoints, 1, self.target_waypoint)
+                self.target_waypoint = nil
+            end
+            return false
+        end
+
+        self.flight_start_pos = {x = pos.x, y = pos.y, z = pos.z}
         self.state = "takeoff"
         self.idle_timer = 0
+        self.stuck_timer = 0
+        self.last_pos = {x = pos.x, y = pos.y, z = pos.z}
+
         local dest_name = (self.target_waypoint and (self.target_waypoint.name or "(" .. self.target_waypoint.x .. "," .. self.target_waypoint.z .. ")")) or "Unknown"
         core.log("action", "[Airliner] Takeoff initiated towards " .. dest_name .. " (Cruise Alt: " .. self.target_cruise_y .. ")")
         if self.pilot and self.pilot:is_player() then
-            core.chat_send_player(self.pilot:get_player_name(), "[Airliner] Takeoff! Flying to " .. dest_name .. " at altitude Y=" .. self.target_cruise_y .. ".")
+            core.chat_send_player(self.pilot:get_player_name(), "[Airliner] Runway clear! Taking off towards " .. dest_name .. " (Climbing to Y=" .. self.target_cruise_y .. " over 100 blocks).")
         end
         return true
     end,
 
     _force_landing = function(self)
-        self.state = "descending"
-        self.target_waypoint = nil
+        local pos = self.object:get_pos()
+        if not pos then return end
+        self.state = "landing"
+        self.landing_start_y = pos.y
+        self.landing_target_y = find_ground_y(pos, 300) or pos.y
+        self.stuck_timer = 0
+        self.last_pos = {x = pos.x, y = pos.y, z = pos.z}
         core.log("action", "[Airliner] Force landing initiated.")
     end,
 
@@ -511,54 +780,23 @@ core.register_entity("airliner:airliner", {
         if #self.full_route < 2 then return end
 
         local pos = self.object:get_pos()
+        if not pos then return end
         self.takeoff_y = pos.y
 
-        if self.route_direction == "forward" then
-            self.route_direction = "reverse"
-            self.waypoints = {}
-            for i = #self.full_route - 1, 1, -1 do
-                table.insert(self.waypoints, {
-                    x = self.full_route[i].x,
-                    y = self.full_route[i].y,
-                    z = self.full_route[i].z,
-                    name = self.full_route[i].name,
-                })
-            end
-        else
-            self.route_direction = "forward"
-            self.waypoints = {}
-            for i = 2, #self.full_route do
-                table.insert(self.waypoints, {
-                    x = self.full_route[i].x,
-                    y = self.full_route[i].y,
-                    z = self.full_route[i].z,
-                    name = self.full_route[i].name,
-                })
-            end
-        end
-
-        if #self.waypoints > 0 then
-            self.target_waypoint = table.remove(self.waypoints, 1)
-            local target_y = self.target_waypoint.y or pos.y
-            self.target_cruise_y = math.max(MIN_CRUISE_Y, math.max(pos.y, target_y) + CRUISE_ALT_OFFSET)
-            self.state = "takeoff"
-            self.idle_timer = 0
-            local dest_name = self.target_waypoint.name or "(" .. self.target_waypoint.x .. "," .. self.target_waypoint.z .. ")"
-            core.log("action", "[Airliner] Auto-return shuttle: taking off (" .. self.route_direction .. ") towards " .. dest_name)
-        end
+        self:_start_takeoff()
     end,
 
     -- -----------------------------------------------------------------------
-    -- on_step: High-precision long-distance airline flight
+    -- on_step: High-precision 100-block takeoff, cruise & landing
     -- -----------------------------------------------------------------------
 
     on_step = function(self, dtime)
         if dtime > 0.5 then dtime = 0.5 end
         local pos = self.object:get_pos()
-        if pos then
-            if not self.plane_id or self.plane_id == "" then
-                self.plane_id = "plane_" .. tostring(math.random(1000000, 9999999))
-            end
+        if not pos then return end
+
+        -- Update global tracker
+        if self.plane_id then
             local t = airliner.tracked_planes[self.plane_id] or {}
             t.id = self.plane_id
             t.object = self.object
@@ -571,14 +809,23 @@ core.register_entity("airliner:airliner", {
             t.route_direction = self.route_direction
             t.idle_timer = self.idle_timer
             t.target_cruise_y = self.target_cruise_y
+            t.takeoff_y = self.takeoff_y
+            t.flight_start_pos = self.flight_start_pos
+            t.landing_start_y = self.landing_start_y
+            t.landing_target_y = self.landing_target_y
             t.pilot_name = self.pilot_name
             t.passenger_names = self.passenger_names
             airliner.tracked_planes[self.plane_id] = t
         end
 
-        -- ===== GROUND / ARRIVED =====
-        if self.state == "ground" or self.state == "arrived" then
-            if not self:_has_players() and #self.full_route >= 2 then
+        -- ===== GROUND / ARRIVED / STUCK =====
+        if self.state == "ground" or self.state == "arrived" or self.state == "stuck" then
+            if self.forceloaded_pos then
+                core.forceload_free_block(self.forceloaded_pos, true)
+                self.forceloaded_pos = nil
+            end
+
+            if self.state ~= "stuck" and not self:_has_players() and #self.full_route >= 2 then
                 self.idle_timer = self.idle_timer + dtime
                 if self.idle_timer >= IDLE_TIMEOUT then
                     self:_auto_return()
@@ -589,54 +836,16 @@ core.register_entity("airliner:airliner", {
             return
         end
 
-        -- ===== DESCENDING STRAIGHT DOWN ONTO TARGET =====
-        if self.state == "descending" then
-            local pos = self.object:get_pos()
-            local target = self.target_waypoint
-
-            -- Maintain exact horizontal alignment on target while descending
-            local align_x = (target and target.x) or pos.x
-            local align_z = (target and target.z) or pos.z
-
-            local move_y = -DESCEND_SPEED * dtime
-            local next_y = pos.y + move_y
-
-            -- Find ground below current horizontal position
-            local ground_y = find_ground_y({x = align_x, y = pos.y, z = align_z}, 300)
-            local target_land_y = (target and target.y)
-
-            -- Land when reaching ground level or target Y
-            local final_ground = ground_y or target_land_y
-            if final_ground and next_y <= final_ground + 1.0 then
-                self.object:set_pos({x = align_x, y = final_ground + 0.5, z = align_z})
-                self.state = "arrived"
-                self.target_waypoint = nil
-                self.idle_timer = 0
-                if self.forceloaded_pos then
-                    core.forceload_free_block(self.forceloaded_pos, true)
-                    self.forceloaded_pos = nil
-                end
-                core.log("action", "[Airliner] Touched down at (" .. math.floor(align_x) .. ", " .. math.floor(final_ground) .. ", " .. math.floor(align_z) .. "). Landing complete.")
-                if self.pilot_name and self.pilot_name ~= "" then
-                    core.chat_send_player(self.pilot_name, "[Airliner] Landed safely at destination. Right-click to dismount.")
-                end
-            else
-                self.object:set_pos({x = align_x, y = next_y, z = align_z})
-            end
-            return
-        end
-
-        -- ===== FLYING STATES =====
+        -- ===== ACTIVE FLIGHT =====
         if not self.target_waypoint then
             self.state = "ground"
             return
         end
 
-        local pos = self.object:get_pos()
         local target = self.target_waypoint
         local cruise_y = self.target_cruise_y or (self.takeoff_y + CRUISE_ALT_OFFSET)
 
-        -- Keep the current mapblock forceloaded so autonomous flight never unloads
+        -- Keep active mapblock forceloaded during flight
         local mb_pos = {
             x = math.floor(pos.x / 16) * 16,
             y = math.floor(pos.y / 16) * 16,
@@ -661,23 +870,44 @@ core.register_entity("airliner:airliner", {
             h_dir = {x = 0, y = 0, z = 0}
         end
 
-        -- Rotate aircraft towards flight direction
-        if h_dist > 1 then
-            self.object:set_yaw(math.atan2(-h_dir.x, h_dir.z))
-        end
+        local yaw = math.atan2(-h_dir.x, h_dir.z)
 
-        -- ----- TAKEOFF: Climb to cruise altitude -----
+        -- ----- TAKEOFF: 100-block ground roll & natural climb -----
         if self.state == "takeoff" then
-            local alt_diff = cruise_y - pos.y
-            if alt_diff > 1.5 then
-                local fwd_speed = CRUISE_SPEED * 0.4
-                local step_x = pos.x + h_dir.x * fwd_speed * dtime
-                local step_y = pos.y + CLIMB_SPEED * dtime
-                local step_z = pos.z + h_dir.z * fwd_speed * dtime
-                self.object:set_pos({x = step_x, y = step_y, z = step_z})
+            local start = self.flight_start_pos or pos
+            local d_flown = math.sqrt((pos.x - start.x)^2 + (pos.z - start.z)^2)
+
+            if d_flown < TAKEOFF_DISTANCE and pos.y < cruise_y - 0.5 then
+                if d_flown <= TAKEOFF_ROLL_DIST then
+                    -- 1. Ground roll on runway: accelerate forward, level attitude
+                    local roll_progress = d_flown / TAKEOFF_ROLL_DIST
+                    local fwd_speed = TAXI_SPEED + (35 - TAXI_SPEED) * roll_progress
+                    local step_x = pos.x + h_dir.x * fwd_speed * dtime
+                    local step_z = pos.z + h_dir.z * fwd_speed * dtime
+                    self.object:set_pos({x = step_x, y = start.y, z = step_z})
+                    set_aircraft_rotation(self.object, 0, yaw, 0)
+                else
+                    -- 2. Lift-off & climb: smooth S-curve climb with nose-up pitch attitude
+                    local climb_u = (d_flown - TAKEOFF_ROLL_DIST) / (TAKEOFF_DISTANCE - TAKEOFF_ROLL_DIST)
+                    climb_u = math.max(0, math.min(1, climb_u))
+                    local smooth_u = climb_u * climb_u * (3 - 2 * climb_u)
+
+                    local climb_speed = 35 + (CRUISE_SPEED - 35) * climb_u
+                    local step_x = pos.x + h_dir.x * climb_speed * dtime
+                    local step_z = pos.z + h_dir.z * climb_speed * dtime
+                    local target_y = start.y + (cruise_y - start.y) * smooth_u
+
+                    -- Nose-up pitch attitude during climb (~11.5 degrees max)
+                    local pitch_angle = -0.20 * math.sin(climb_u * math.pi)
+
+                    self.object:set_pos({x = step_x, y = target_y, z = step_z})
+                    set_aircraft_rotation(self.object, pitch_angle, yaw, 0)
+                end
             else
+                -- Reached cruise altitude & transitioned out of 100-block takeoff corridor
                 self.state = "cruise"
                 self.object:set_pos({x = pos.x, y = cruise_y, z = pos.z})
+                set_aircraft_rotation(self.object, 0, yaw, 0)
                 core.log("action", "[Airliner] Reached cruise altitude (" .. math.floor(cruise_y) .. "m). Cruising at " .. CRUISE_SPEED .. "m/s.")
             end
             return
@@ -685,10 +915,9 @@ core.register_entity("airliner:airliner", {
 
         -- ----- CRUISE: Fly horizontally towards target -----
         if self.state == "cruise" then
-            -- Are we close to the waypoint horizontally?
-            if h_dist < WAYPOINT_DIST then
-                if #self.waypoints > 0 then
-                    -- Transition smoothly to next waypoint without losing altitude
+            if #self.waypoints > 0 then
+                -- Intermediate waypoint transition
+                if h_dist < WAYPOINT_DIST then
                     local next_wp = table.remove(self.waypoints, 1)
                     self.target_waypoint = next_wp
                     local next_name = next_wp.name or ("WP (" .. next_wp.x .. "," .. next_wp.z .. ")")
@@ -697,39 +926,157 @@ core.register_entity("airliner:airliner", {
                         core.chat_send_player(self.pilot:get_player_name(), "[Airliner] Waypoint reached. Next stop: " .. next_name)
                     end
                 else
-                    -- Final destination: switch to landing approach
-                    self.state = "landing"
-                    core.log("action", "[Airliner] Approaching final destination (" .. math.floor(target.x) .. "," .. math.floor(target.z) .. "). Preparing descent.")
+                    local step_x = pos.x + h_dir.x * CRUISE_SPEED * dtime
+                    local step_z = pos.z + h_dir.z * CRUISE_SPEED * dtime
+                    self.object:set_pos({x = step_x, y = cruise_y, z = step_z})
+                    set_aircraft_rotation(self.object, 0, yaw, 0)
                 end
             else
-                -- Fly at cruise altitude directly toward destination
-                local step_x = pos.x + h_dir.x * CRUISE_SPEED * dtime
-                local step_z = pos.z + h_dir.z * CRUISE_SPEED * dtime
-                self.object:set_pos({x = step_x, y = cruise_y, z = step_z})
+                -- Approaching final destination: begin 100-block landing glide slope
+                if h_dist <= LANDING_DISTANCE then
+                    self.state = "landing"
+                    self.landing_start_y = pos.y
+                    local target_ground = find_ground_y({x = target.x, y = pos.y, z = target.z}, 300)
+                    self.landing_target_y = (target.y and target.y > 0 and target.y) or target_ground or pos.y
+                    self.stuck_timer = 0
+                    self.last_pos = {x = pos.x, y = pos.y, z = pos.z}
+                    core.log("action", "[Airliner] Entering 100-block landing glide slope to " .. (target.name or "destination") .. " (Runway Y=" .. self.landing_target_y .. ").")
+                    if self.pilot and self.pilot:is_player() then
+                        core.chat_send_player(self.pilot:get_player_name(), "[Airliner] Approaching runway. Descending on glide slope towards " .. (target.name or "runway") .. ".")
+                    end
+                else
+                    local step_x = pos.x + h_dir.x * CRUISE_SPEED * dtime
+                    local step_z = pos.z + h_dir.z * CRUISE_SPEED * dtime
+                    self.object:set_pos({x = step_x, y = cruise_y, z = step_z})
+                    set_aircraft_rotation(self.object, 0, yaw, 0)
+                end
             end
             return
         end
 
-        -- ----- LANDING: Align directly above destination then descend -----
-        if self.state == "landing" then
-            if h_dist <= LANDING_ALIGN_DIST then
-                -- Precisely aligned above destination! Begin vertical descent onto waypoint
-                self.object:set_pos({x = target.x, y = pos.y, z = target.z})
-                self.state = "descending"
-                core.log("action", "[Airliner] Directly over destination runway/beacon. Descending vertically.")
-            else
-                -- Slow down and fly directly to exact target X/Z
-                local approach_speed = math.max(8, math.min(CRUISE_SPEED * 0.5, h_dist * 2))
-                local move_step = approach_speed * dtime
-                if move_step >= h_dist then
-                    self.object:set_pos({x = target.x, y = pos.y, z = target.z})
-                    self.state = "descending"
+        -- ----- LANDING / DESCENDING: Natural 100-block Glide Slope, Flare & Touchdown -----
+        if self.state == "landing" or self.state == "descending" then
+            local target_y = (target.y ~= nil and target.y) or (self.landing_target_y ~= nil and self.landing_target_y) or pos.y
+            local start_y = self.landing_start_y or cruise_y
+
+            -- Ensure destination mapblock is also forceloaded so runway is loaded
+            local dest_mb = {
+                x = math.floor(target.x / 16) * 16,
+                y = math.floor(target_y / 16) * 16,
+                z = math.floor(target.z / 16) * 16,
+            }
+            if not self.forceloaded_dest or self.forceloaded_dest.x ~= dest_mb.x or self.forceloaded_dest.y ~= dest_mb.y or self.forceloaded_dest.z ~= dest_mb.z then
+                if self.forceloaded_dest then
+                    core.forceload_free_block(self.forceloaded_dest, true)
+                end
+                core.forceload_block(dest_mb, true)
+                self.forceloaded_dest = dest_mb
+            end
+
+            -- Obstruction / Stuck Detection during landing (only if players onboard)
+            if self:_has_players() and self.last_pos then
+                local dist_moved = vector.distance(pos, self.last_pos)
+                if dist_moved < 0.05 * dtime then
+                    self.stuck_timer = (self.stuck_timer or 0) + dtime
+                    if self.stuck_timer >= STUCK_TIMEOUT then
+                        self.state = "stuck"
+                        if self.forceloaded_pos then
+                            core.forceload_free_block(self.forceloaded_pos, true)
+                            self.forceloaded_pos = nil
+                        end
+                        if self.forceloaded_dest then
+                            core.forceload_free_block(self.forceloaded_dest, true)
+                            self.forceloaded_dest = nil
+                        end
+                        core.log("warning", "[Airliner] Airliner obstructed / stuck during landing descent at (" .. math.floor(pos.x) .. "," .. math.floor(pos.y) .. "," .. math.floor(pos.z) .. ")!")
+                        if self.pilot and self.pilot:is_player() then
+                            core.chat_send_player(self.pilot:get_player_name(), "[Airliner] Airliner obstructed / hung on terrain during landing! Emergency dismount enabled: Right-click to exit safely.")
+                        end
+                        if self.passengers then
+                            for _, pass in ipairs(self.passengers) do
+                                if pass and pass:is_player() then
+                                    core.chat_send_player(pass:get_player_name(), "[Airliner] Airliner obstructed / hung during landing! Right-click to exit safely.")
+                                end
+                            end
+                        end
+                        return
+                    end
                 else
-                    self.object:set_pos({
-                        x = pos.x + h_dir.x * move_step,
-                        y = pos.y,
-                        z = pos.z + h_dir.z * move_step,
-                    })
+                    self.stuck_timer = math.max(0, (self.stuck_timer or 0) - dtime)
+                end
+            end
+            self.last_pos = {x = pos.x, y = pos.y, z = pos.z}
+
+            local p = 1.0 - math.max(0, math.min(1, h_dist / LANDING_DISTANCE)) -- 0 at 100m, 1 at touchdown
+
+            if h_dist > 15.0 and p < 0.85 then
+                -- 1. Glide Slope Descent (100m to 15m out): smooth descent with gentle nose-down pitch
+                local g = p / 0.85
+                local app_speed = TAXI_SPEED + (CRUISE_SPEED - TAXI_SPEED) * (1 - g)
+                local move_step = app_speed * dtime
+
+                local next_y = start_y - (start_y - (target_y + 2.0)) * (g^1.2)
+                local pitch_angle = 0.08 * (1 - g) -- Slight nose-down attitude on glide slope
+
+                local next_x = pos.x + h_dir.x * move_step
+                local next_z = pos.z + h_dir.z * move_step
+
+                self.object:set_pos({x = next_x, y = next_y, z = next_z})
+                set_aircraft_rotation(self.object, pitch_angle, yaw, 0)
+            elseif h_dist > 1.5 then
+                -- 2. Flare Zone (last 15m before touchdown): pitch nose up slightly to flare and settle smoothly
+                local f = (p - 0.85) / 0.15
+                f = math.max(0, math.min(1, f))
+                local flare_speed = math.max(6, TAXI_SPEED * (1 - f * 0.4))
+                local move_step = flare_speed * dtime
+
+                local next_y = (target_y + 2.0) - 1.5 * f
+                local pitch_angle = -0.06 * math.sin(f * math.pi) -- Nose-up flare attitude
+
+                local next_x = pos.x + h_dir.x * move_step
+                local next_z = pos.z + h_dir.z * move_step
+
+                self.object:set_pos({x = next_x, y = next_y, z = next_z})
+                set_aircraft_rotation(self.object, pitch_angle, yaw, 0)
+            elseif pos.y > target_y + 0.8 then
+                -- 3. Vertical descent to runway (if aligned above destination at altitude)
+                local sink_speed = 10 -- m/s descent
+                local next_y = pos.y - sink_speed * dtime
+                if next_y <= target_y + 0.5 then
+                    next_y = target_y + 0.5
+                end
+                self.object:set_pos({x = target.x, y = next_y, z = target.z})
+                set_aircraft_rotation(self.object, 0, yaw, 0)
+            else
+                -- 4. Touchdown & Arrival
+                local final_ground = find_ground_y({x = target.x, y = target_y + 5, z = target.z}, 50) or target_y
+                self.object:set_pos({x = target.x, y = final_ground + 0.5, z = target.z})
+                set_aircraft_rotation(self.object, 0, yaw, 0)
+                self.object:set_properties({static_save = true})
+                self.state = "arrived"
+                self.target_waypoint = nil
+                self.idle_timer = 0
+                self.stuck_timer = 0
+
+                if self.forceloaded_pos then
+                    core.forceload_free_block(self.forceloaded_pos, true)
+                    self.forceloaded_pos = nil
+                end
+                if self.forceloaded_dest then
+                    core.forceload_free_block(self.forceloaded_dest, true)
+                    self.forceloaded_dest = nil
+                end
+
+                core.log("action", "[Airliner] Touched down at (" .. math.floor(target.x) .. ", " .. math.floor(final_ground) .. ", " .. math.floor(target.z) .. "). Landing complete.")
+                if self.pilot_name and self.pilot_name ~= "" then
+                    core.chat_send_player(self.pilot_name, "[Airliner] Landed safely at destination. Right-click to dismount.")
+                end
+                if self.passengers then
+                    for _, pass in ipairs(self.passengers) do
+                        if pass and pass:is_player() then
+                            core.chat_send_player(pass:get_player_name(), "[Airliner] Landed safely at destination. Right-click to dismount.")
+                        end
+                    end
                 end
             end
             return
@@ -849,7 +1196,7 @@ core.register_on_player_receive_fields(function(player, formname, fields)
 end)
 
 -- ----------------------------------------------------------------------------
--- Right-click handler for boarding & flight computer
+-- Right-click handler for boarding, flight computer & dismount
 -- ----------------------------------------------------------------------------
 
 local original_entity = core.registered_entities["airliner:airliner"]
@@ -865,14 +1212,14 @@ original_entity.on_rightclick = function(self, clicker)
 
     local p_name = clicker:get_player_name()
 
-    if self.state ~= "ground" and self.state ~= "arrived" then
-        core.chat_send_player(p_name, "[Airliner] Cannot board while the airliner is flying.")
-        return
-    end
-
     -- If this player is already aboard (as pilot or passenger), detach them!
     if self.pilot_name == p_name or (self.passenger_names and self.passenger_names[p_name]) or (self.pilot and self.pilot == clicker) then
         airliner.detach(clicker, false)
+        return
+    end
+
+    if self.state ~= "ground" and self.state ~= "arrived" and self.state ~= "stuck" then
+        core.chat_send_player(p_name, "[Airliner] Cannot board while the airliner is flying.")
         return
     end
 
@@ -880,13 +1227,16 @@ original_entity.on_rightclick = function(self, clicker)
 end
 
 -- ----------------------------------------------------------------------------
--- Globalstep: Pilot Input & Autonomous Flight Simulator
+-- Globalstep: Pilot Input & 30s Periodic Status Logger to debug.txt
 -- ----------------------------------------------------------------------------
+
+local debug_log_timer = 0
+local DEBUG_LOG_INTERVAL = 30 -- seconds
 
 core.register_globalstep(function(dtime)
     if dtime > 0.5 then dtime = 0.5 end
 
-    -- 1. Pilot AUX1 key detection
+    -- 1. Pilot AUX1 key detection for takeoff
     for _, player in pairs(core.get_connected_players()) do
         local parent = player:get_attach()
         if parent then
@@ -897,7 +1247,7 @@ core.register_globalstep(function(dtime)
                 if controls and controls.aux1 then
                     if not ent.aux1_held then
                         ent.aux1_held = true
-                        if ent.state == "ground" or ent.state == "arrived" then
+                        if ent.state == "ground" or ent.state == "arrived" or ent.state == "stuck" then
                             ent:_start_takeoff()
                         end
                     end
@@ -910,169 +1260,221 @@ core.register_globalstep(function(dtime)
         end
     end
 
-    -- 2. Autonomous Flight Simulator for unmanned / remote planes
-    for plane_id, plane in pairs(airliner.tracked_planes) do
-        local has_players = false
-        if plane.pilot_name and plane.pilot_name ~= "" then has_players = true end
-        if plane.passenger_names and next(plane.passenger_names) ~= nil then has_players = true end
+    -- 2. Remote Simulation & Auto-Materialization for Unmanned Aircraft
+    for plane_id, p in pairs(airliner.tracked_planes) do
+        local is_live_obj = p.object and p.object.get_pos and p.object:get_pos() ~= nil
+        local has_active_pilot = (p.pilot_name and p.pilot_name ~= "") or (p.passenger_names and next(p.passenger_names) ~= nil)
 
-        -- If plane is flying unmanned (no players inside)
-        if not has_players and plane.target_waypoint and (plane.state == "takeoff" or plane.state == "cruise" or plane.state == "landing" or plane.state == "descending") then
-            local pos = plane.pos
-            local target = plane.target_waypoint
-            local cruise_y = plane.target_cruise_y or 120
+        -- If unmanned airliner has no live entity in world, check if any player is nearby to materialize it
+        if not is_live_obj and not has_active_pilot and p.pos then
+            local player_nearby = false
+            for _, pl in pairs(core.get_connected_players()) do
+                local ppos = pl:get_pos()
+                if ppos and vector.distance(ppos, p.pos) < 150 then
+                    player_nearby = true
+                    break
+                end
+            end
+
+            if player_nearby then
+                local obj = airliner.materialize_entity(plane_id)
+                if obj then
+                    is_live_obj = true
+                end
+            end
+        end
+
+        if not is_live_obj and not has_active_pilot and (p.state == "cruise" or p.state == "takeoff" or p.state == "landing" or p.state == "descending") and p.target_waypoint then
+            local pos = p.pos or {x = 0, y = 120, z = 0}
+            local target = p.target_waypoint
+            local start = p.flight_start_pos or pos
+            local cruise_y = p.target_cruise_y or 120
 
             local dx = target.x - pos.x
             local dz = target.z - pos.z
             local h_dist = math.sqrt(dx * dx + dz * dz)
+            local d_flown = math.sqrt((pos.x - start.x)^2 + (pos.z - start.z)^2)
 
             local h_dir
             if h_dist > 0.01 then
-                h_dir = {x = dx / h_dist, y = 0, z = dz / h_dist}
+                h_dir = {x = dx / h_dist, z = dz / h_dist}
             else
-                h_dir = {x = 0, y = 0, z = 0}
+                h_dir = {x = 0, z = 0}
             end
 
-            -- Update simulated position
-            if plane.state == "takeoff" then
-                local alt_diff = cruise_y - pos.y
-                if alt_diff > 1.5 then
-                    local fwd_speed = CRUISE_SPEED * 0.4
-                    pos.x = pos.x + h_dir.x * fwd_speed * dtime
-                    pos.y = pos.y + CLIMB_SPEED * dtime
-                    pos.z = pos.z + h_dir.z * fwd_speed * dtime
-                else
-                    pos.y = cruise_y
-                    plane.state = "cruise"
-                end
-            elseif plane.state == "cruise" then
-                if h_dist < WAYPOINT_DIST then
-                    if plane.waypoints and #plane.waypoints > 0 then
-                        plane.target_waypoint = table.remove(plane.waypoints, 1)
+            -- Remote TAKEOFF Phase (100 blocks climb)
+            if p.state == "takeoff" then
+                if d_flown < TAKEOFF_DISTANCE and pos.y < cruise_y - 0.5 then
+                    if d_flown <= TAKEOFF_ROLL_DIST then
+                        local roll_prog = d_flown / TAKEOFF_ROLL_DIST
+                        local fwd_speed = TAXI_SPEED + (35 - TAXI_SPEED) * roll_prog
+                        pos.x = pos.x + h_dir.x * fwd_speed * dtime
+                        pos.z = pos.z + h_dir.z * fwd_speed * dtime
+                        pos.y = start.y
                     else
-                        plane.state = "landing"
+                        local climb_u = (d_flown - TAKEOFF_ROLL_DIST) / (TAKEOFF_DISTANCE - TAKEOFF_ROLL_DIST)
+                        climb_u = math.max(0, math.min(1, climb_u))
+                        local smooth_u = climb_u * climb_u * (3 - 2 * climb_u)
+                        local climb_speed = 35 + (CRUISE_SPEED - 35) * climb_u
+                        pos.x = pos.x + h_dir.x * climb_speed * dtime
+                        pos.z = pos.z + h_dir.z * climb_speed * dtime
+                        pos.y = start.y + (cruise_y - start.y) * smooth_u
                     end
                 else
-                    pos.x = pos.x + h_dir.x * CRUISE_SPEED * dtime
+                    p.state = "cruise"
                     pos.y = cruise_y
-                    pos.z = pos.z + h_dir.z * CRUISE_SPEED * dtime
+                    core.log("action", "[Airliner] Unmanned airliner " .. plane_id .. " reached cruise altitude (" .. math.floor(cruise_y) .. "m). Cruising at " .. CRUISE_SPEED .. "m/s.")
                 end
-            elseif plane.state == "landing" then
-                if h_dist <= LANDING_ALIGN_DIST then
-                    pos.x = target.x
-                    pos.z = target.z
-                    plane.state = "descending"
-                else
-                    local approach_speed = math.max(8, math.min(CRUISE_SPEED * 0.5, h_dist * 2))
-                    local move_step = approach_speed * dtime
-                    if move_step >= h_dist then
-                        pos.x = target.x
-                        pos.z = target.z
-                        plane.state = "descending"
+                p.pos = pos
+                core.forceload_block(pos, true)
+
+            -- Remote CRUISE Phase
+            elseif p.state == "cruise" then
+                pos.y = cruise_y
+                if #(p.waypoints or {}) > 0 then
+                    if h_dist < WAYPOINT_DIST then
+                        local next_wp = table.remove(p.waypoints, 1)
+                        p.target_waypoint = next_wp
+                        core.log("action", "[Airliner] Unmanned airliner " .. plane_id .. " reached intermediate waypoint. Next: " .. (next_wp.name or "WP"))
                     else
-                        pos.x = pos.x + h_dir.x * move_step
-                        pos.z = pos.z + h_dir.z * move_step
+                        pos.x = pos.x + h_dir.x * CRUISE_SPEED * dtime
+                        pos.z = pos.z + h_dir.z * CRUISE_SPEED * dtime
+                    end
+                else
+                    if h_dist <= LANDING_DISTANCE then
+                        p.state = "landing"
+                        p.landing_start_y = pos.y
+                        p.landing_target_y = (target.y and target.y > 0 and target.y) or 10
+                        core.log("action", "[Airliner] Unmanned airliner " .. plane_id .. " entering landing glide slope to " .. (target.name or "destination"))
+                    else
+                        pos.x = pos.x + h_dir.x * CRUISE_SPEED * dtime
+                        pos.z = pos.z + h_dir.z * CRUISE_SPEED * dtime
                     end
                 end
-            elseif plane.state == "descending" then
-                local target_y = target.y or 10
-                local next_y = pos.y - DESCEND_SPEED * dtime
-                if next_y <= target_y + 1.0 then
+                p.pos = pos
+                core.forceload_block(pos, true)
+
+            -- Remote LANDING Phase (100 blocks glide slope)
+            elseif p.state == "landing" or p.state == "descending" then
+                local target_y = (target.y and target.y > 0 and target.y) or (p.landing_target_y and p.landing_target_y > 0 and p.landing_target_y) or 10
+                local start_y = p.landing_start_y or cruise_y
+                local prog = 1.0 - math.max(0, math.min(1, h_dist / LANDING_DISTANCE))
+
+                if h_dist > 15.0 and prog < 0.85 then
+                    local g = prog / 0.85
+                    local app_speed = TAXI_SPEED + (CRUISE_SPEED - TAXI_SPEED) * (1 - g)
+                    pos.y = start_y - (start_y - (target_y + 2.0)) * (g^1.2)
+                    pos.x = pos.x + h_dir.x * app_speed * dtime
+                    pos.z = pos.z + h_dir.z * app_speed * dtime
+                    p.pos = pos
+                    core.forceload_block(pos, true)
+                elseif h_dist > 1.5 then
+                    local f = (prog - 0.85) / 0.15
+                    f = math.max(0, math.min(1, f))
+                    local flare_speed = math.max(6, TAXI_SPEED * (1 - f * 0.4))
+                    pos.y = (target_y + 2.0) - 1.5 * f
+                    pos.x = pos.x + h_dir.x * flare_speed * dtime
+                    pos.z = pos.z + h_dir.z * flare_speed * dtime
+                    p.pos = pos
+                    core.forceload_block(pos, true)
+                else
+                    -- Touchdown & Arrival
                     pos.x = target.x
                     pos.y = target_y + 0.5
                     pos.z = target.z
-                    plane.state = "arrived"
-                    plane.target_waypoint = nil
-                    plane.idle_timer = 0
-                    core.log("action", "[Airliner] Global flight manager: Autonomous touchdown at (" .. math.floor(pos.x) .. "," .. math.floor(pos.y) .. "," .. math.floor(pos.z) .. ").")
-                else
-                    pos.y = next_y
+                    p.pos = pos
+                    p.state = "arrived"
+                    p.target_waypoint = nil
+                    p.idle_timer = 0
+                    core.forceload_block(p.pos, true)
+                    core.log("action", "[Airliner] Unmanned airliner " .. plane_id .. " arrived at " .. (target.name or "destination") .. " via remote shuttle simulation.")
+                    airliner.materialize_entity(plane_id)
                 end
             end
 
-            plane.pos = pos
-
-            -- If the entity object is active in memory, update its position and rotation
-            if plane.object and plane.object.get_pos and plane.object:get_pos() then
-                plane.object:set_pos(pos)
-                if h_dist > 1 then
-                    plane.object:set_yaw(math.atan2(-h_dir.x, h_dir.z))
-                end
-            end
-        end
-
-        -- If plane is arrived and idle, tick the idle_timer in globalstep
-        if not has_players and (plane.state == "arrived" or plane.state == "ground") and plane.full_route and #plane.full_route >= 2 then
-            plane.idle_timer = (plane.idle_timer or 0) + dtime
-            if plane.idle_timer >= IDLE_TIMEOUT then
-                -- Launch auto return in globalstep
-                plane.idle_timer = 0
-                if plane.route_direction == "forward" then
-                    plane.route_direction = "reverse"
-                    plane.waypoints = {}
-                    for i = #plane.full_route - 1, 1, -1 do
-                        table.insert(plane.waypoints, {
-                            x = plane.full_route[i].x,
-                            y = plane.full_route[i].y,
-                            z = plane.full_route[i].z,
-                            name = plane.full_route[i].name,
+        -- Remote Auto-Return Shuttle
+        elseif not is_live_obj and not has_active_pilot and (p.state == "arrived" or p.state == "ground") and #(p.full_route or {}) >= 2 then
+            p.idle_timer = (p.idle_timer or 0) + dtime
+            if p.idle_timer >= IDLE_TIMEOUT then
+                p.idle_timer = 0
+                p.waypoints = {}
+                if p.route_direction == "forward" then
+                    p.route_direction = "reverse"
+                    for i = #p.full_route - 1, 1, -1 do
+                        table.insert(p.waypoints, {
+                            x = p.full_route[i].x,
+                            y = p.full_route[i].y,
+                            z = p.full_route[i].z,
+                            name = p.full_route[i].name,
                         })
                     end
                 else
-                    plane.route_direction = "forward"
-                    plane.waypoints = {}
-                    for i = 2, #plane.full_route do
-                        table.insert(plane.waypoints, {
-                            x = plane.full_route[i].x,
-                            y = plane.full_route[i].y,
-                            z = plane.full_route[i].z,
-                            name = plane.full_route[i].name,
+                    p.route_direction = "forward"
+                    for i = 2, #p.full_route do
+                        table.insert(p.waypoints, {
+                            x = p.full_route[i].x,
+                            y = p.full_route[i].y,
+                            z = p.full_route[i].z,
+                            name = p.full_route[i].name,
                         })
                     end
                 end
-                if #plane.waypoints > 0 then
-                    plane.target_waypoint = table.remove(plane.waypoints, 1)
-                    local target_y = plane.target_waypoint.y or plane.pos.y
-                    plane.target_cruise_y = math.max(MIN_CRUISE_Y, math.max(plane.pos.y, target_y) + CRUISE_ALT_OFFSET)
-                    plane.state = "takeoff"
-                    core.log("action", "[Airliner] Global flight manager: Autonomous shuttle departing (" .. plane.route_direction .. ")")
+
+                if #p.waypoints > 0 then
+                    p.target_waypoint = table.remove(p.waypoints, 1)
+                    local pos = p.pos or {x = 0, y = 10, z = 0}
+                    p.takeoff_y = pos.y
+                    p.flight_start_pos = {x = pos.x, y = pos.y, z = pos.z}
+                    local target_y = (p.target_waypoint and p.target_waypoint.y) or pos.y
+                    local max_y = math.max(pos.y, target_y)
+                    p.target_cruise_y = math.max(MIN_CRUISE_Y, max_y + CRUISE_ALT_OFFSET)
+                    p.state = "takeoff"
+                    p.stuck_timer = 0
+                    local dest_name = (p.target_waypoint and (p.target_waypoint.name or "(" .. p.target_waypoint.x .. "," .. p.target_waypoint.z .. ")")) or "Unknown"
+                    core.log("action", "[Airliner] Unmanned airliner " .. plane_id .. " auto-departing on return flight towards " .. dest_name .. " (Cruise Alt: " .. p.target_cruise_y .. ")")
                 end
             end
         end
+    end
 
-        -- 3. Proximity Spawner: Ensure 3D airliner entity appears when a player is within range
-        local plane_has_obj = plane.object and plane.object.get_pos and (plane.object:get_pos() ~= nil)
-        if not plane_has_obj and plane.pos then
-            local should_spawn = false
-            for _, player in pairs(core.get_connected_players()) do
-                local p_pos = player:get_pos()
-                if p_pos then
-                    local dist = vec_distance(p_pos, plane.pos)
-                    if dist < 120 then
-                        should_spawn = true
-                        break
-                    end
-                end
+    -- 3. Periodic 30-second Airliner Status Dump to debug.txt
+    debug_log_timer = debug_log_timer + dtime
+    if debug_log_timer >= DEBUG_LOG_INTERVAL then
+        debug_log_timer = 0
+
+        local t_stamp = os.date("%Y-%m-%d %H:%M:%S")
+        local lines = {}
+        table.insert(lines, "=== AIRLINER STATUS LOG [" .. t_stamp .. "] ===")
+        local count = 0
+
+        for plane_id, p in pairs(airliner.tracked_planes) do
+            count = count + 1
+            local pos = (p.object and p.object.get_pos and p.object:get_pos()) or p.pos or {x = 0, y = 0, z = 0}
+            local state = p.state or "UNKNOWN"
+            local tw_str = "None"
+            if p.target_waypoint then
+                local tw = p.target_waypoint
+                tw_str = (tw.name or "WP") .. " at (" .. math.floor(tw.x or 0) .. "," .. math.floor(tw.y or 0) .. "," .. math.floor(tw.z or 0) .. ")"
             end
-            if should_spawn then
-                local obj = core.add_entity(plane.pos, "airliner:airliner")
-                if obj then
-                    local ent = obj:get_luaentity()
-                    if ent then
-                        ent.state = plane.state
-                        ent.owner = plane.owner
-                        ent.waypoints = plane.waypoints or {}
-                        ent.full_route = plane.full_route or {}
-                        ent.target_waypoint = plane.target_waypoint
-                        ent.route_direction = plane.route_direction or "forward"
-                        ent.target_cruise_y = plane.target_cruise_y
-                        ent.idle_timer = plane.idle_timer or 0
-                        ent.plane_id = plane_id
-                        plane.object = obj
-                        core.log("action", "[Airliner] Rendered 3D airliner for player near (" .. math.floor(plane.pos.x) .. "," .. math.floor(plane.pos.y) .. "," .. math.floor(plane.pos.z) .. ").")
-                    end
-                end
-            end
+            local wps_count = #(p.waypoints or {})
+            local route_count = #(p.full_route or {})
+            local idle = math.floor(p.idle_timer or 0)
+            local pilot = (p.pilot_name and p.pilot_name ~= "" and p.pilot_name) or "None"
+            local is_obj_live = (p.object and p.object.get_pos and p.object:get_pos() ~= nil) and "LIVE" or "TRACKED"
+
+            local entry = string.format("[%d] ID: %s (%s) | State: %s | Pos: (%.1f, %.1f, %.1f) | Target: %s | Queued WPs: %d | Route Stops: %d | Direction: %s | Idle: %ds | Pilot: %s",
+                count, plane_id, is_obj_live, string.upper(state), pos.x, pos.y, pos.z, tw_str, wps_count, route_count, (p.route_direction or "forward"), idle, pilot)
+            table.insert(lines, entry)
+        end
+
+        if count == 0 then
+            table.insert(lines, "  No active airliners currently tracked in the world.")
+        end
+        table.insert(lines, "============================================================\n")
+
+        -- Write directly to the general game debug.txt via Minetest logging engine
+        for _, line in ipairs(lines) do
+            core.log("none", "[Airliner] " .. line)
         end
     end
 end)
@@ -1158,7 +1560,7 @@ core.register_craftitem("airliner:airliner_spawner", {
         local obj = airliner.spawn(pos, owner)
         if obj then
             local yaw = placer:get_look_horizontal()
-            obj:set_yaw(yaw)
+            set_aircraft_rotation(obj, 0, yaw, 0)
 
             if not core.is_creative_enabled(owner) then
                 itemstack:take_item()
@@ -1207,12 +1609,12 @@ local function find_owned_airliner(name)
     local nearest = nil
     local min_dist = math.huge
 
-    -- 1. Check all active in-memory object_refs
+    -- 1. Check local in-memory objects
     for _, obj in pairs(core.object_refs) do
         local ent = airliner.get_airliner(obj)
         if ent then
             local is_owner = (ent.owner == name or ent.owner == nil or ent.owner == "" or core.check_player_privs(name, {protection_bypass = true}))
-            if is_owner then
+            if is_owner and obj:get_pos() then
                 local dist = vector.distance(p_pos, obj:get_pos())
                 if dist < min_dist then
                     min_dist = dist
@@ -1224,16 +1626,24 @@ local function find_owned_airliner(name)
 
     if nearest then return nearest end
 
-    -- 2. If plane has flown far away, query the global tracker!
+    -- 2. Check tracked planes globally (even if object is far away / in remote mapblock)
     for _, plane_info in pairs(airliner.tracked_planes) do
         local is_owner = (plane_info.owner == name or plane_info.owner == nil or plane_info.owner == "" or core.check_player_privs(name, {protection_bypass = true}))
         if is_owner then
+            if plane_info.object and plane_info.object.get_pos and plane_info.object:get_pos() then
+                local ent = airliner.get_airliner(plane_info.object)
+                if ent then return ent end
+            end
             return plane_info
         end
     end
 
     -- 3. Fallback to any tracked plane in singleplayer
     for _, plane_info in pairs(airliner.tracked_planes) do
+        if plane_info.object and plane_info.object.get_pos and plane_info.object:get_pos() then
+            local ent = airliner.get_airliner(plane_info.object)
+            if ent then return ent end
+        end
         return plane_info
     end
 
@@ -1257,7 +1667,7 @@ core.register_chatcommand("airliner_spawn", {
 
         local obj = airliner.spawn(spawn_pos, name)
         if obj then
-            obj:set_yaw(player:get_look_horizontal())
+            set_aircraft_rotation(obj, 0, player:get_look_horizontal(), 0)
             return true, "Airliner spawned."
         end
         return false, "Failed to spawn airliner."
@@ -1276,7 +1686,12 @@ core.register_chatcommand("airliner_waypoint", {
         end
 
         local pos = {x = tonumber(x), y = tonumber(y), z = tonumber(z)}
-        airliner.add_waypoint(ent.object, pos, "WP (" .. pos.x .. "," .. pos.z .. ")")
+        local obj = ent.object or (ent.id and airliner.tracked_planes[ent.id] and airliner.tracked_planes[ent.id].object)
+        if obj then
+            airliner.add_waypoint(obj, pos, "WP (" .. pos.x .. "," .. pos.z .. ")")
+        elseif ent.waypoints then
+            table.insert(ent.waypoints, {x = pos.x, y = pos.y, z = pos.z, name = "WP (" .. pos.x .. "," .. pos.z .. ")"})
+        end
         return true, "Waypoint added at (" .. pos.x .. ", " .. pos.y .. ", " .. pos.z .. ")."
     end
 })
@@ -1291,7 +1706,12 @@ core.register_chatcommand("airliner_waypoint_here", {
         if not ent then return false, "No owned airliner found." end
 
         local p_pos = player:get_pos()
-        airliner.add_waypoint(ent.object, p_pos, "Player Location")
+        local obj = ent.object or (ent.id and airliner.tracked_planes[ent.id] and airliner.tracked_planes[ent.id].object)
+        if obj then
+            airliner.add_waypoint(obj, p_pos, "Player Location")
+        elseif ent.waypoints then
+            table.insert(ent.waypoints, {x = p_pos.x, y = p_pos.y, z = p_pos.z, name = "Player Location"})
+        end
         return true, "Waypoint added at your location (" .. math.floor(p_pos.x) .. "," .. math.floor(p_pos.y) .. "," .. math.floor(p_pos.z) .. ")."
     end
 })
@@ -1306,7 +1726,12 @@ core.register_chatcommand("airliner_beacon", {
         if not b then
             return false, "Beacon '" .. param .. "' not found. Use /airliner_beacons to list."
         end
-        airliner.add_waypoint(ent.object, {x = b.x, y = b.y, z = b.z}, b.name)
+        local obj = ent.object or (ent.id and airliner.tracked_planes[ent.id] and airliner.tracked_planes[ent.id].object)
+        if obj then
+            airliner.add_waypoint(obj, {x = b.x, y = b.y, z = b.z}, b.name)
+        elseif ent.waypoints then
+            table.insert(ent.waypoints, {x = b.x, y = b.y, z = b.z, name = b.name})
+        end
         return true, "Added destination: " .. b.name .. " (" .. b.x .. "," .. b.y .. "," .. b.z .. ")"
     end
 })
@@ -1358,7 +1783,7 @@ core.register_chatcommand("airliner_route", {
         if not ent then return false, "No owned airliner found." end
 
         local msg = "=== Active Flight Plan ===\n"
-        if #ent.waypoints == 0 then
+        if #(ent.waypoints or {}) == 0 then
             msg = msg .. "  No waypoints currently queued in airliner.\n"
         else
             for i, wp in ipairs(ent.waypoints) do
@@ -1366,8 +1791,8 @@ core.register_chatcommand("airliner_route", {
                 msg = msg .. "  " .. i .. ". " .. wname .. " -> (" .. wp.x .. ", " .. wp.y .. ", " .. wp.z .. ")\n"
             end
         end
-        if #ent.full_route >= 2 then
-            msg = msg .. "Full Shuttle Route: " .. #ent.full_route .. " stops (" .. ent.route_direction .. ")\n"
+        if #(ent.full_route or {}) >= 2 then
+            msg = msg .. "Full Shuttle Route: " .. #ent.full_route .. " stops (" .. (ent.route_direction or "forward") .. ")\n"
         end
         return true, msg
     end
@@ -1391,19 +1816,29 @@ core.register_chatcommand("airliner_clear", {
         local ent = find_owned_airliner(name)
         if not ent then return false, "No owned airliner found." end
 
-        airliner.clear_waypoints(ent.object)
+        local obj = ent.object or (ent.id and airliner.tracked_planes[ent.id] and airliner.tracked_planes[ent.id].object)
+        if obj then
+            airliner.clear_waypoints(obj)
+        else
+            ent.waypoints = {}
+            ent.full_route = {}
+            ent.target_waypoint = nil
+        end
         return true, "Waypoints and shuttle route cleared."
     end
 })
 
 core.register_chatcommand("airliner_stop", {
-    description = "Stops the airliner safely.",
+    description = "Forces the airliner into a safe landing descent.",
     func = function(name, param)
         local ent = find_owned_airliner(name)
         if not ent then return false, "No owned airliner found." end
 
-        airliner.stop(ent.object)
-        return true, "Airliner stop command issued."
+        local obj = ent.object or (ent.id and airliner.tracked_planes[ent.id] and airliner.tracked_planes[ent.id].object)
+        if obj then
+            airliner.stop(obj)
+        end
+        return true, "Airliner landing initiated."
     end
 })
 
@@ -1424,6 +1859,9 @@ core.register_chatcommand("airliner_remove", {
 
         if ent.object then ent.object:remove() end
         if ent.plane_id then airliner.tracked_planes[ent.plane_id] = nil end
+        if ent.id then airliner.tracked_planes[ent.id] = nil end
+        if ent.forceloaded_pos then core.forceload_free_block(ent.forceloaded_pos, true) end
+        if ent.forceloaded_dest then core.forceload_free_block(ent.forceloaded_dest, true) end
         return true, "Airliner removed."
     end
 })
@@ -1436,25 +1874,18 @@ core.register_chatcommand("airliner_tp", {
         local ent = find_owned_airliner(name)
         if not ent then return false, "No owned airliner found." end
 
+        local plane_id = ent.plane_id or ent.id
         local pos = (ent.object and ent.object.get_pos and ent.object:get_pos()) or ent.pos
+        if not pos and plane_id and airliner.tracked_planes[plane_id] then
+            pos = airliner.tracked_planes[plane_id].pos
+        end
+
         if pos then
-            player:set_pos({x = pos.x, y = pos.y + 2, z = pos.z})
-            if not ent.object or not ent.object:get_pos() then
-                local obj = airliner.spawn(pos, ent.owner)
-                if obj then
-                    local new_ent = obj:get_luaentity()
-                    if new_ent then
-                        new_ent.state = ent.state
-                        new_ent.waypoints = ent.waypoints or {}
-                        new_ent.full_route = ent.full_route or {}
-                        new_ent.target_waypoint = ent.target_waypoint
-                        new_ent.route_direction = ent.route_direction
-                        new_ent.target_cruise_y = ent.target_cruise_y
-                        new_ent.idle_timer = ent.idle_timer
-                        ent.object = obj
-                    end
-                end
+            core.forceload_block(pos, true)
+            if plane_id then
+                airliner.materialize_entity(plane_id)
             end
+            player:set_pos({x = pos.x, y = pos.y + 2, z = pos.z})
             return true, "Teleported to airliner at (" .. math.floor(pos.x) .. ", " .. math.floor(pos.y) .. ", " .. math.floor(pos.z) .. ")."
         end
         return false, "Could not determine airliner location."
@@ -1462,9 +1893,15 @@ core.register_chatcommand("airliner_tp", {
 })
 
 core.register_chatcommand("airliner_kill_all", {
-    description = "Removes all airliner entities in the world (useful for cleaning up stuck test planes).",
+    description = "Removes all airliner entities in the world and invalidates all past planes.",
     func = function(name, param)
         local count = 0
+        local now = os.time()
+        global_kill_epoch = now
+        if mod_storage and mod_storage.set_int then
+            mod_storage:set_int("kill_epoch", now)
+        end
+
         for _, obj in pairs(core.object_refs) do
             local ent = airliner.get_airliner(obj)
             if ent then
@@ -1474,12 +1911,20 @@ core.register_chatcommand("airliner_kill_all", {
                         airliner.detach(ent.passengers[i], true)
                     end
                 end
+                if ent.forceloaded_pos then core.forceload_free_block(ent.forceloaded_pos, true) end
+                if ent.forceloaded_dest then core.forceload_free_block(ent.forceloaded_dest, true) end
                 obj:remove()
                 count = count + 1
             end
         end
+        for plane_id, p in pairs(airliner.tracked_planes) do
+            if p.object and p.object.get_pos and p.object:get_pos() then
+                p.object:remove()
+                count = count + 1
+            end
+        end
         airliner.tracked_planes = {}
-        return true, "Cleaned up " .. count .. " airliner(s)."
+        return true, "Cleaned up all airliners in world (Kill Epoch: " .. now .. ")."
     end
 })
 
@@ -1490,7 +1935,8 @@ core.register_chatcommand("airliner_status", {
         if not ent then return false, "No owned airliner found." end
 
         local pos = (ent.object and ent.object.get_pos and ent.object:get_pos()) or ent.pos or {x = 0, y = 0, z = 0}
-        local msg = "State: " .. ent.state
+        local state = ent.state or "UNKNOWN"
+        local msg = "State: " .. string.upper(state)
         msg = msg .. " | Pos: (" .. math.floor(pos.x) .. ", " .. math.floor(pos.y) .. ", " .. math.floor(pos.z) .. ")"
         msg = msg .. " | Waypoints queued: " .. #(ent.waypoints or {})
         msg = msg .. " | Route stops: " .. #(ent.full_route or {})
@@ -1505,9 +1951,12 @@ core.register_chatcommand("airliner_status", {
         elseif ent.pilot_name or ent.passenger_names then
             has_players = (ent.pilot_name and ent.pilot_name ~= "") or (ent.passenger_names and next(ent.passenger_names) ~= nil)
         end
-        if (ent.state == "arrived" or ent.state == "ground") and not has_players and #(ent.full_route or {}) >= 2 then
+        if (state == "arrived" or state == "ground") and not has_players and #(ent.full_route or {}) >= 2 then
             local remaining = math.max(0, math.floor(IDLE_TIMEOUT - (ent.idle_timer or 0)))
             msg = msg .. "\nAuto-depart in: " .. remaining .. "s"
+        end
+        if state == "stuck" then
+            msg = msg .. "\n[WARNING] Aircraft is currently obstructed/stuck on landing. Right-click to dismount safely."
         end
         return true, msg
     end

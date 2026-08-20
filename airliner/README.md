@@ -1,13 +1,16 @@
 # Airliner Mod
 
-An attachable self-flying airliner with waypoint navigation, airport beacon tracking, Flight Computer GUI, and automatic shuttle loop for Luanti / Minetest.
+An attachable self-flying airliner with waypoint navigation, airport beacon tracking, Flight Computer GUI, natural 100-block takeoff & landing glide slopes, and automatic shuttle loop for Luanti / Minetest.
 
 ## Features
 - **High-Speed Long-Distance Airline Flight**: Cruises smoothly across thousands of nodes at 50 m/s at a safe cruising altitude.
+- **Natural 100-Block Takeoff**: Rolls 25 nodes down the runway, rotates, and smoothly climbs to cruising altitude over 100 blocks with pitch-up aircraft attitude.
+- **Pre-Flight Runway Clearance Check**: Scans the 100-block takeoff corridor for trees, structures, or terrain obstacles; alerts the pilot with `"Runway blocked"` if the path is obstructed.
+- **Natural 100-Block Landing Glide Slope**: Transitions into a gentle 100-block descent glide slope, flares before touchdown, and rolls to a smooth halt on the runway.
+- **Landing Stuck & Obstruction Recovery**: Detects if the airliner hangs or gets obstructed on landing, alerting players with emergency dismount enabled so they can exit safely onto solid ground.
+- **Single-Machine Shuttle Loop**: Reverses route after 5 minutes idle and flies back cleanly as a single aircraft without entity duplication.
 - **Airport Waypoint Beacons**: Placeable beacon nodes that act as named airport / runway destinations.
 - **Interactive Flight Computer GUI**: Shift + Right-Click a parked airliner (or use `/airliner_gui`) to view route, select beacons from a dropdown, add coordinates, or launch.
-- **High-Precision Vertical Landing**: Approaches destinations at cruising altitude, aligns directly above the target (X, Z), and touches down gently onto the runway/beacon.
-- **Auto-Return Shuttle Loop**: If parked at a destination for 5 minutes without passengers, the airliner automatically takes off, reverses its route, and flies back to origin.
 - **100 HP & Pickaxe Removable**: Aircraft can be punched or dug with pickaxes to take damage (100 HP total), dropping the spawner item upon destruction.
 
 ## Installation
@@ -32,8 +35,8 @@ An attachable self-flying airliner with waypoint navigation, airport beacon trac
 
 ## Flying and Takeoff
 - **Boarding**: Right-click the airliner when grounded to board as the Pilot. Passengers can also right-click to board (up to 10 players total).
-- **Takeoff**: Press `E` (or `AUX1`) while seated as Pilot, or click **Takeoff** in the Flight Computer.
-- **Dismount**: Right-click when the airliner has landed safely to dismount.
+- **Takeoff**: Press `E` (or `AUX1`) while seated as Pilot, or click **Takeoff** in the Flight Computer. Takeoff will automatically verify that the 100-block runway corridor is clear.
+- **Dismount**: Right-click when the airliner has landed or if stuck to dismount safely.
 
 ## Chat Commands
 - `/airliner_gui` - Opens the Flight Computer GUI.
@@ -44,9 +47,9 @@ An attachable self-flying airliner with waypoint navigation, airport beacon trac
 - `/airliner_clear` - Clears the current route.
 - `/airliner_status` - Displays state, coordinates, queued stops, and auto-depart countdown.
 - `/airliner_tp` - Teleports you directly to your airliner.
-- `/airliner_stop` - Forces a safe landing straight down.
+- `/airliner_stop` - Forces a safe landing glide slope descent.
 - `/airliner_remove` - Removes the nearest airliner.
-- `/airliner_kill_all` - Removes all airliners in the world (useful to clean up old test planes).
+- `/airliner_kill_all` - Removes all airliners in the world.
 
 ## Crafting Recipes
 - **Airliner Spawner**: 5 Steel Ingots + 2 Glass blocks.
